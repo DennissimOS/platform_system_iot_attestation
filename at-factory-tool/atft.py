@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
 # Copyright 2017 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +21,11 @@ locates Fastboot devices and can initiate communication between the ATFA and
 an Android Things device.
 """
 from datetime import datetime
-from sys import platform
+import json
+import math
+import os
+import sys
+import tempfile
 import threading
 
 from atftman import AtftManager
@@ -32,17 +37,17 @@ from fastboot_exceptions import ProductNotSpecifiedException
 
 import wx
 
-if platform.startswith('linux'):
+if sys.platform.startswith('linux'):
   from fastbootsh import FastbootDevice
   from serialmapperlinux import SerialMapper
-elif platform.startswith('win'):
+elif sys.platform.startswith('win'):
   from fastbootsubp import FastbootDevice
   from serialmapperwin import SerialMapper
 
 
 # If this is set to True, no prerequisites would be checked against manual
 # operation, such as you can do key provisioning before fusing the vboot key.
-TEST_MODE = True
+TEST_MODE = False
 
 
 class AtftException(Exception):
@@ -82,6 +87,162 @@ class AtftException(Exception):
     return '{0}: {1}'.format(e.__class__.__name__, e)
 
 
+class AtftLog(object):
+  """The class to handle logging.
+
+  Logs would be created under LOG_DIR with the time stamp when the log is
+  created as file name. There would be at most LOG_FILE_NUMBER log files and
+  each log file size would be less than log_size/log_file_number, so the total
+  log size would less than log_size.
+  """
+
+  def __init__(self, log_dir, log_size, log_file_number):
+    """Initiate the AtftLog object.
+
+    This function would also write the first 'Program Start' log entry.
+
+    Args:
+      log_dir: The directory to store logs.
+      log_size: The maximum total size for all the log files.
+      log_file_number: The maximum number for log files.
+    """
+    if not os.path.exists(log_dir):
+      # If log directory does not exist, try to create it.
+      try:
+        os.mkdir(log_dir)
+      except IOError:
+        return
+    self.log_dir = log_dir
+    self.log_dir_file = None
+    self.file_size = 0
+    self.log_size = log_size
+    self.log_file_number = log_file_number
+    self.file_size_max = math.floor(self.log_size / self.log_file_number)
+    self.lock = threading.Lock()
+
+    log_files = []
+    for file_name in os.listdir(self.log_dir):
+      if (os.path.isfile(os.path.join(self.log_dir, file_name)) and
+          file_name.startswith('atft_log_')):
+        log_files.append(file_name)
+    if not log_files:
+      # Create the first log file.
+      self._CreateLogFile()
+    else:
+      log_files.sort()
+      self.log_dir_file = os.path.join(self.log_dir, log_files.pop())
+    self.Info('Program', 'Program start')
+
+  def Error(self, tag, string):
+    """Print an error message to the log.
+
+    Args:
+      tag: The tag for the message.
+      string: The error message.
+    """
+    self._Output('E', tag, string)
+
+  def Debug(self, tag, string):
+    """Print a debug message to the log.
+
+    Args:
+      tag: The tag for the message.
+      string: The debug message.
+    """
+    self._Output('D', tag, string)
+
+  def Warning(self, tag, string):
+    """Print a warning message to the log.
+
+    Args:
+      tag: The tag for the message.
+      string: The warning message.
+    """
+    self._Output('W', tag, string)
+
+  def Info(self, tag, string):
+    """Print an info message to the log.
+
+    Args:
+      tag: The tag for the message.
+      string: The info message.
+    """
+    self._Output('I', tag, string)
+
+  def _Output(self, code, tag, string):
+    """Output a line of message to the log file.
+
+    Args:
+      code: The log level.
+      tag: The log tag.
+      string: The log message.
+    """
+    time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    message = '[{0}] {1}/{2}: {3}'.format(
+        time, code, tag, string.replace('\n', '\t'))
+    if self.log_dir_file:
+      message += '\n'
+      with self.lock:
+        self._LimitSize(message)
+        with open(self.log_dir_file, 'a') as log_file:
+          log_file.write(message)
+          log_file.flush()
+
+  def _LimitSize(self, message):
+    """This function limits the total size of logs.
+
+    It would create a new log file if the log file is too large. If the total
+    number of log files is larger than threshold, then it would delete the
+    oldest log.
+
+    Args:
+      message: The log message about to be added.
+    """
+    file_size = os.path.getsize(self.log_dir_file)
+    if file_size + len(message) > self.file_size_max:
+      # If file size will exceed file_size_max, then create a new file and close
+      # the current one.
+      self._CreateLogFile()
+    log_files = []
+    for file_name in os.listdir(self.log_dir):
+      if (os.path.isfile(os.path.join(self.log_dir, file_name)) and
+          file_name.startswith('atft_log_')):
+        log_files.append(file_name)
+
+    if len(log_files) > self.log_file_number:
+      # If file number exceeds LOG_FILE_NUMBER, then delete the oldest file.
+      try:
+        log_files.sort()
+        oldest_file = os.path.join(self.log_dir, log_files[0])
+        os.remove(oldest_file)
+      except IOError:
+        pass
+
+  def _CreateLogFile(self):
+    """Create a new log file using timestamp as file name.
+    """
+    timestamp = int((datetime.now() - datetime(1970, 1, 1)).total_seconds())
+    log_file_name = 'atft_log_' + str(timestamp)
+    log_file_path = os.path.join(self.log_dir, log_file_name)
+    i = 1
+    while os.path.exists(log_file_path):
+      # If already exists, create another name, timestamp_1, timestamp_2, etc.
+      log_file_name_new = log_file_name + '_' + str(i)
+      log_file_path = os.path.join(self.log_dir, log_file_name_new)
+      i += 1
+    try:
+      log_file = open(log_file_path, 'w+')
+      log_file.close()
+      self.log_dir_file = log_file_path
+    except IOError:
+      self.log_dir_file = None
+
+  def __del__(self):
+    """Cleanup function. This would log the 'Program Exit' message.
+    """
+    self.Info('Program', 'Program exit')
+
+
 class Event(wx.PyCommandEvent):
   """The customized event class.
   """
@@ -105,7 +266,6 @@ class Event(wx.PyCommandEvent):
     """
     return self._value
 
-
 class Atft(wx.Frame):
   """wxpython class to handle all GUI commands for the ATFA.
 
@@ -113,91 +273,30 @@ class Atft(wx.Frame):
   ATFA and an Android Things device.
 
   """
-  # The interval for device refresh.
-  DEVICE_REFRESH_INTERVAL = 1.0
-  # The timeout allow for a device to reboot.
-  REBOOT_TIMEOUT = 60.0
+  CONFIG_FILE = 'config.json'
 
   ID_TOOL_PROVISION = 1
   ID_TOOL_CLEAR = 2
 
-  SORT_BY_LOCATION_TEXT = 'Sort by location'
-  SORT_BY_SERIAL_TEXT = 'Sort by serial'
-
-  # Top level menus
-  MENU_APPLICATION = ' Application '
-  MENU_KEY_PROVISIONING = 'Key Provisioning'
-  MENU_ATFA_DEVICE = ' ATFA Device '
-  MENU_AUDIT = '    Audit    '
-  MENU_KEY_MANAGEMENT = 'Key Management'
-
-  # Second level menus
-  MENU_CLEAR_COMMAND = 'Clear Command Output'
-  MENU_SHOW_STATUS_BAR = 'Show Statusbar'
-  MENU_SHOW_TOOL_BAR = 'Show Toolbar'
-  MENU_CHOOSE_PRODUCT = 'Choose Product'
-  MENU_QUIT = 'quit'
-
-  MENU_MANUAL_FUSE_VBOOT = 'Fuse Bootloader Vboot Key'
-  MENU_MANUAL_FUSE_ATTR = 'Fuse Permanent Attributes'
-  MENU_MANUAL_LOCK_AVB = 'Lock Android Verified Boot'
-  MENU_MANUAL_PROV = 'Provision Key'
-
-  MENU_STORAGE = 'Storage Mode'
-
-  MENU_ATFA_STATUS = 'ATFA Status'
-  MENU_KEY_THRESHOLD = 'Key Warning Threshold'
-  MENU_REBOOT = 'Reboot'
-  MENU_SHUTDOWN = 'Shutdown'
-
-  MENU_STOREKEY = 'Store Key Bundle'
-  MENU_PROCESSKEY = 'Process Key Bundle'
-
-  # Toolbar icon names
-  TOOLBAR_AUTO_PROVISION = 'Automatic Provision'
-  TOOLBAR_ATFA_STATUS = 'ATFA Status'
-  TOOLBAR_CLEAR_COMMAND = 'Clear Command Output'
-
-  # Title
-  TITLE = 'Google Android Things Factory Tool'
-
-  # Area titles
-  TITLE_ATFA_DEV = 'Atfa Device'
-  TITLE_PRODUCT_NAME = 'Product:'
-  TITLE_PRODUCT_NAME_NOTCHOSEN = 'Not Chosen'
-  TITLE_KEYS_LEFT = 'Attestation Keys Left:'
-  TITLE_TARGET_DEV = 'Target Devices'
-  TITLE_COMMAND_OUTPUT = 'Command Output'
-
-  # Field names
-  FIELD_SERIAL_NUMBER = 'Serial Number'
-  FIELD_USB_LOCATION = 'USB Location'
-  FIELD_STATUS = 'Status'
-  FIELD_SERIAL_WIDTH = 200
-  FIELD_USB_WIDTH = 350
-  FIELD_STATUS_WIDTH = 240
-
-  # Dialogs
-  DIALOG_CHANGE_THRESHOLD_TEXT = 'ATFA Key Warning Threshold:'
-  DIALOG_CHANGE_THRESHOLD_TITLE = 'Change ATFA Key Warning Threshold'
-  DIALOG_LOW_KEY_TEXT = ''
-  DIALOG_LOW_KEY_TITLE = 'Low Key Alert'
-  DIALOG_ALERT_TEXT = ''
-  DIALOG_ALERT_TITLE = 'Alert'
-
-  # Buttons
-  BUTTON_TARGET_DEV_TOGGLE_SORT = 'target_device_sort_button'
-
   def __init__(self):
 
+    self.configs = self.ParseConfigFile()
+
+    self.SetLanguage()
+
+    self.TITLE += ' ' + self.ATFT_VERSION
+
     # The atft_manager instance to manage various operations.
-    self.atft_manager = AtftManager(FastbootDevice, SerialMapper)
+    self.atft_manager = self.CreateAtftManager()
 
     # The target devices refresh timer object
     self.refresh_timer = None
 
     # The field to sort target devices
     self.sort_by = self.atft_manager.SORT_BY_LOCATION
+
+    # List of serial numbers for the devices in auto provisioning mode.
+    self.auto_dev_serials = []
 
     # Store the last refreshed target list, we use this list to prevent
     # refreshing the same list.
@@ -226,8 +325,269 @@ class Atft(wx.Frame):
 
     # Lock for showing alert box
     self.alert_lock = threading.Lock()
+    # The key threshold, if the number of attestation key in the ATFA device
+    # is lower than this number, an alert would appear.
+    self.key_threshold = self.DEFAULT_KEY_THRESHOLD
 
     self.InitializeUI()
+
+    if self.configs == None:
+      self.ShowAlert(self.ALERT_FAIL_TO_PARSE_CONFIG)
+      sys.exit(0)
+
+    self.log = self.CreateAtftLog()
+
+    if not self.log.log_dir_file:
+      self._SendAlertEvent(self.ALERT_FAIL_TO_CREATE_LOG)
+
+    self.StartRefreshingDevices()
+    self.ChooseProduct(None)
+
+  def CreateAtftManager(self):
+    """Create an AtftManager object.
+
+    This function exists for test mocking.
+    """
+    return AtftManager(FastbootDevice, SerialMapper, self.configs)
+
+  def CreateAtftLog(self):
+    """Create an AtftLog object.
+
+    This function exists for test mocking.
+    """
+    return AtftLog(self.LOG_DIR, self.LOG_SIZE, self.LOG_FILE_NUMBER)
+
+  def ParseConfigFile(self):
+    """Parse the configuration file and read in the necessary configurations.
+
+    Returns:
+      The parsed configuration map.
+    """
+    # Give default values
+    self.ATFT_VERSION = 'v0.0'
+    self.COMPATIBLE_ATFA_VERSION = 'v0'
+    self.DEVICE_REFRESH_INTERVAL = 1.0
+    self.DEFAULT_KEY_THRESHOLD = 0
+    self.LOG_DIR = None
+    self.LOG_SIZE = 0
+    self.LOG_FILE_NUMBER = 0
+    self.LANGUAGE = 'eng'
+    self.REBOOT_TIMEOUT = 0
+    self.PRODUCT_ATTRIBUTE_FILE_EXTENSION = '*.atpa'
+
+    config_file_path = os.path.join(self._GetCurrentPath(), self.CONFIG_FILE)
+    if not os.path.exists(config_file_path):
+      return None
+
+    with open(config_file_path, 'r') as config_file:
+      configs = json.loads(config_file.read())
+
+    if not configs:
+      return None
+
+    try:
+      self.ATFT_VERSION = str(configs['ATFT_VERSION'])
+      self.COMPATIBLE_ATFA_VERSION = str(configs['COMPATIBLE_ATFA_VERSION'])
+      self.DEVICE_REFRESH_INTERVAL = float(configs['DEVICE_REFRESH_INTERVAL'])
+      self.DEFAULT_KEY_THRESHOLD = int(configs['DEFAULT_KEY_THRESHOLD'])
+      self.LOG_DIR = str(configs['LOG_DIR'])
+      self.LOG_SIZE = int(configs['LOG_SIZE'])
+      self.LOG_FILE_NUMBER = int(configs['LOG_FILE_NUMBER'])
+      self.LANGUAGE = str(configs['LANGUAGE'])
+      self.REBOOT_TIMEOUT = float(configs['REBOOT_TIMEOUT'])
+      self.PRODUCT_ATTRIBUTE_FILE_EXTENSION = str(
+          configs['PRODUCT_ATTRIBUTE_FILE_EXTENSION'])
+    except (KeyError, ValueError):
+      return None
+
+    return configs
+
+  def _StoreConfigToFile(self):
+    """Store the configuration to the configuration file.
+
+    By storing the configuration back, the program would remember the
+    configuration if it's opened again.
+    """
+    config_file_path = os.path.join(self._GetCurrentPath(), self.CONFIG_FILE)
+    with open(config_file_path, 'w') as config_file:
+      config_file.write(json.dumps(self.configs, sort_keys=True, indent=4))
+
+  def _GetCurrentPath(self):
+    """Get the current directory.
+
+    Returns:
+      The current directory.
+    """
+    if getattr(sys, 'frozen', False):
+      # we are running in a bundle
+      path = sys._MEIPASS  # pylint: disable=protected-access
+    else:
+      # we are running in a normal Python environment
+      path = os.path.dirname(os.path.abspath(__file__))
+    return path
+
+  def GetLanguageIndex(self):
+    """Translate language setting to an index.
+
+    Returns:
+      index: A index representing the language.
+    """
+    index = 0
+    if self.LANGUAGE == 'eng':
+      index = 0
+    if self.LANGUAGE == 'cn':
+      index = 1
+    return index
+
+  def SetLanguage(self):
+    """Set the string constants according to the language setting.
+    """
+    index = self.GetLanguageIndex()
+
+    self.SORT_BY_LOCATION_TEXT = ['Sort by location', '按照位置排序'][index]
+    self.SORT_BY_SERIAL_TEXT = ['Sort by serial', '按照序列号排序'][index]
+
+    # Top level menus
+    self.MENU_APPLICATION = ['Application', '应用'][index]
+    self.MENU_KEY_PROVISIONING = ['Key Provisioning', '密钥传输'][index]
+    self.MENU_ATFA_DEVICE = ['ATFA Device', 'ATFA 管理'][index]
+    self.MENU_AUDIT = ['Audit', '审计'][index]
+    self.MENU_KEY_MANAGEMENT = ['Key Management', '密钥管理'][index]
+
+    # Second level menus
+    self.MENU_CLEAR_COMMAND = ['Clear Command Output', '清空控制台'][index]
+    self.MENU_SHOW_STATUS_BAR = ['Show Statusbar', '显示状态栏'][index]
+    self.MENU_SHOW_TOOL_BAR = ['Show Toolbar', '显示工具栏'][index]
+    self.MENU_CHOOSE_PRODUCT = ['Choose Product', '选择产品'][index]
+    self.MENU_QUIT = ['quit', '退出'][index]
+
+    self.MENU_MANUAL_FUSE_VBOOT = ['Fuse Bootloader Vboot Key',
+                                   '烧录引导密钥'][index]
+    self.MENU_MANUAL_FUSE_ATTR = ['Fuse Permanent Attributes',
+                                  '烧录产品信息'][index]
+    self.MENU_MANUAL_LOCK_AVB = ['Lock Android Verified Boot', '锁定AVB'][index]
+    self.MENU_MANUAL_PROV = ['Provision Key', '传输密钥'][index]
+
+    self.MENU_STORAGE = ['Storage Mode', 'U盘模式'][index]
+
+    self.MENU_ATFA_STATUS = ['ATFA Status', '查询余量'][index]
+    self.MENU_KEY_THRESHOLD = ['Key Warning Threshold', '密钥警告阈值'][index]
+    self.MENU_REBOOT = ['Reboot', '重启'][index]
+    self.MENU_SHUTDOWN = ['Shutdown', '关闭'][index]
+
+    self.MENU_STOREKEY = ['Store Key Bundle', '存储密钥打包文件'][index]
+    self.MENU_PROCESSKEY = ['Process Key Bundle', '处理密钥打包文件'][index]
+
+    # Toolbar icon names
+    self.TOOLBAR_AUTO_PROVISION = ['Automatic Provision', '自动模式'][index]
+    self.TOOLBAR_ATFA_STATUS = self.MENU_ATFA_STATUS
+    self.TOOLBAR_CLEAR_COMMAND = self.MENU_CLEAR_COMMAND
+
+    # Title
+    self.TITLE = ['Google Android Things Factory Tool',
+                  'Google Android Things 工厂程序'][index]
+
+    # Area titles
+    self.TITLE_ATFA_DEV = ['Atfa Device', 'ATFA 设备'][index]
+    self.TITLE_PRODUCT_NAME = ['Product:', '产品：'][index]
+    self.TITLE_PRODUCT_NAME_NOTCHOSEN = ['Not Chosen', '未选择'][index]
+    self.TITLE_KEYS_LEFT = ['Attestation Keys Left:', '剩余密钥:'][index]
+    self.TITLE_TARGET_DEV = ['Target Devices', '目标设备'][index]
+    self.TITLE_COMMAND_OUTPUT = ['Command Output', '控制台输出'][index]
+
+    # Field names
+    self.FIELD_SERIAL_NUMBER = ['Serial Number', '序列号'][index]
+    self.FIELD_USB_LOCATION = ['USB Location', '插入位置'][index]
+    self.FIELD_STATUS = ['Status', '状态'][index]
+    self.FIELD_SERIAL_WIDTH = 200
+    self.FIELD_USB_WIDTH = 350
+    self.FIELD_STATUS_WIDTH = 240
+
+    # Dialogs
+    self.DIALOG_CHANGE_THRESHOLD_TEXT = ['ATFA Key Warning Threshold:',
+                                         '密钥警告阈值:'][index]
+    self.DIALOG_CHANGE_THRESHOLD_TITLE = ['Change ATFA Key Warning Threshold',
+                                          '更改密钥警告阈值'][index]
+    self.DIALOG_LOW_KEY_TEXT = ''
+    self.DIALOG_LOW_KEY_TITLE = ['Low Key Alert', '密钥不足警告'][index]
+    self.DIALOG_ALERT_TEXT = ''
+    self.DIALOG_ALERT_TITLE = ['Alert', '警告'][index]
+    self.DIALOG_CHOOSE_PRODUCT_ATTRIBUTE_FILE = [
+        'Choose Product Attributes File', '选择产品文件'][index]
+
+    # Buttons
+    self.BUTTON_TARGET_DEV_TOGGLE_SORT = ['target_device_sort_button',
+                                     '目标设备排序按钮'][index]
+
+    # Alerts
+    self.ALERT_AUTO_PROV_NO_ATFA = [
+        'Cannot enter auto provision mode\nNo ATFA device available!',
+        '无法开启自动模式\n没有可用的ATFA设备！'][index]
+    self.ALERT_AUTO_PROV_NO_PRODUCT = [
+        'Cannot enter auto provision mode\nNo product specified!',
+        '无法开启自动模式\n没有选择产品！'][index]
+    self.ALERT_PROV_NO_SELECTED = [
+        "Can't Provision! No target device selected!",
+        '无法传输密钥！目标设备没有选择！'][index]
+    self.ALERT_PROV_NO_ATFA = [
+        "Can't Provision! No Available ATFA device!",
+        '无法传输密钥！没有ATFA设备!'][index]
+    self.ALERT_PROV_NO_KEYS = [
+        "Can't Provision! No keys left!",
+        '无法传输密钥！没有剩余密钥!'][index]
+    self.ALERT_FUSE_NO_SELECTED = [
+        "Can't Fuse vboot key! No target device selected!",
+        '无法烧录！目标设备没有选择！'][index]
+    self.ALERT_FUSE_NO_PRODUCT = [
+        "Can't Fuse vboot key! No product specified!",
+        '无法烧录！没有选择产品！'][index]
+    self.ALERT_FUSE_PERM_NO_SELECTED = [
+        "Can't Fuse permanent attributes! No target device selected!",
+        '无法烧录产品信息！目标设备没有选择！'][index]
+    self.ALERT_FUSE_PERM_NO_PRODUCT = [
+        "Can't Fuse permanent attributes! No product specified!",
+        '无法烧录产品信息！没有选择产品！'][index]
+    self.ALERT_LOCKAVB_NO_SELECTED = [
+        "Can't Lock Android Verified Boot! No target device selected!",
+        '无法锁定AVB！目标设备没有选择！'][index]
+    self.ALERT_FAIL_TO_CREATE_LOG = [
+        'Failed to create log!',
+        '无法创建日志文件！'][index]
+    self.ALERT_FAIL_TO_PARSE_CONFIG = [
+        'Failed to find or parse config file!',
+        '无法找到或解析配置文件！'][index]
+    self.ALERT_NO_DEVICE = [
+        'No devices found!',
+        '无设备！'][index]
+    self.ALERT_CANNOT_OPEN_FILE = [
+        'Can not open file: ',
+        '无法打开文件: '][index]
+    self.ALERT_PRODUCT_FILE_FORMAT_WRONG = [
+        'The format for the product attributes file is not correct!',
+        '产品文件格式不正确！'][index]
+    self.ALERT_ATFA_UNPLUG = [
+        'ATFA device unplugged, exit auto mode!',
+        'ATFA设备拔出，退出自动模式！'][index]
+    self.ALERT_NO_KEYS_LEFT_LEAVE_PROV = [
+        'No keys left! Leave auto provisioning mode!',
+        '没有剩余密钥，退出自动模式！'][index]
+    self.ALERT_FUSE_VBOOT_FUSED = [
+        'Cannot fuse bootloader vboot key for device that is already fused!',
+        '无法烧录一个已经烧录过引导密钥的设备！'][index]
+    self.ALERT_FUSE_PERM_ATTR_FUSED = [
+        'Cannot fuse permanent attributes for device that is not fused '
+        'bootloader vboot key or already fused permanent attributes!',
+        '无法烧录一个没有烧录过引导密钥或者已经烧录过产品信息的设备！'][index]
+    self.ALERT_LOCKAVB_LOCKED = [
+        'Cannot lock android verified boot for device that is not fused '
+        'permanent attributes or already locked!',
+        '无法锁定一个没有烧录过产品信息或者已经锁定AVB的设备！'][index]
+    self.ALERT_PROV_PROVED = [
+        'Cannot provision device that is not ready for provisioning or '
+        'already provisioned!',
+        '无法传输密钥给一个不在正确状态或者已经拥有密钥的设备！'][index]
+
+
 
   def InitializeUI(self):
     """Initialize the application UI."""
@@ -449,7 +809,7 @@ class Atft(wx.Frame):
     self.cmd_output = wx.TextCtrl(
         self.panel,
         wx.ID_ANY,
-        size=(800, 320),
+        size=(800, 190),
         style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
     self.vbox.Add(self.cmd_output, 0, wx.ALL | wx.EXPAND, 5)
 
@@ -457,7 +817,7 @@ class Atft(wx.Frame):
     self.toolbar.Realize()
     self.statusbar = self.CreateStatusBar()
     self.statusbar.SetStatusText('Ready')
-    self.SetSize((800, 800))
+    self.SetSize((800, 720))
     self.SetTitle(self.TITLE)
     self.Center()
     self.Show(True)
@@ -484,8 +844,6 @@ class Atft(wx.Frame):
         style=wx.OK | wx.ICON_EXCLAMATION | wx.CENTRE)
 
     self._CreateBindEvents()
-    self.StartRefreshingDevices()
-    self.ChooseProduct(None)
 
   def PauseRefresh(self):
     """Pause the refresh for device list during fastboot operations.
@@ -510,8 +868,9 @@ class Atft(wx.Frame):
       text_entry.AppendText(text)
       return
 
-    # Replace existing message. Need to clean first.
-    current_text = text_entry.GetValue()
+    # Replace existing message. Need to clean first. The GetValue() returns
+    # unicode string, need to encode that to utf-8 to compare.
+    current_text = text_entry.GetValue().encode('utf-8')
     if text == current_text:
       # If nothing changes, don't refresh.
       return
@@ -524,7 +883,6 @@ class Atft(wx.Frame):
     Args:
       text: The text to be printed.
     """
-    # TODO(shanyu): Write to log file.
     msg = '[' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '] '
     msg += text + '\n'
     self.PrintToWindow(self.cmd_output, msg, True)
@@ -622,16 +980,14 @@ class Atft(wx.Frame):
     if self.auto_prov and not self.atft_manager.atfa_dev:
       self.auto_prov = False
       self.toolbar.ToggleTool(self.ID_TOOL_PROVISION, False)
-      self._SendAlertEvent('Cannot enter auto provision mode\n'
-                           'No ATFA device available!')
+      self._SendAlertEvent(self.ALERT_AUTO_PROV_NO_ATFA)
       return
 
     # If no product specified.
     if self.auto_prov and not self.atft_manager.product_info:
       self.auto_prov = False
       self.toolbar.ToggleTool(self.ID_TOOL_PROVISION, False)
-      self._SendAlertEvent('Cannot enter auto provision mode\n'
-                           'No product specified!')
+      self._SendAlertEvent(self.ALERT_AUTO_PROV_NO_PRODUCT)
       return
 
     self._ToggleToolbarMenu(self.auto_prov)
@@ -641,14 +997,18 @@ class Atft(wx.Frame):
 
       # Reset the low key alert shown indicator
       self.low_key_alert_shown = False
-      self.PrintToCommandWindow('Automatic key provisioning start')
+      message = 'Automatic key provisioning start'
+      self.PrintToCommandWindow(message)
+      self.log.Info('Autoprov', message)
     else:
       # Leave auto provisioning mode.
       for device in self.atft_manager.target_devs:
-        # Change all waiting devices' status to idle.
+        # Change all waiting devices' status to it's original state.
         if device.provision_status == ProvisionStatus.WAITING:
-          device.provision_status = ProvisionStatus.IDLE
-      self.PrintToCommandWindow('Automatic key provisioning end')
+          self.atft_manager.CheckProvisionStatus(device)
+      message = 'Automatic key provisioning end'
+      self.PrintToCommandWindow(message)
+      self.log.Info('Autoprov', message)
 
   def _ToggleToolbarMenu(self, auto_prov):
     """Disable/Enable buttons and menu items while entering/leaving auto mode.
@@ -680,10 +1040,13 @@ class Atft(wx.Frame):
     """
     selected_serials = self._GetSelectedSerials()
     if not selected_serials:
-      self._SendAlertEvent("Can't Provision! No target device selected!")
+      self._SendAlertEvent(self.ALERT_PROV_NO_SELECTED)
       return
     if not self.atft_manager.atfa_dev:
-      self._SendAlertEvent("Can't Provision! No Available ATFA device!")
+      self._SendAlertEvent(self.ALERT_PROV_NO_ATFA)
+      return
+    if self.atft_manager.GetATFAKeysLeft() == 0:
+      self._SendAlertEvent(self.ALERT_PROV_NO_KEYS)
       return
     self._CreateThread(self._ManualProvision, selected_serials)
 
@@ -703,10 +1066,10 @@ class Atft(wx.Frame):
     """
     selected_serials = self._GetSelectedSerials()
     if not selected_serials:
-      self._SendAlertEvent("Can't Fuse vboot key! No target device selected!")
+      self._SendAlertEvent(self.ALERT_FUSE_NO_SELECTED)
       return
     if not self.atft_manager.product_info:
-      self._SendAlertEvent("Can't Fuse vboot key! No product specified!")
+      self._SendAlertEvent(self.ALERT_FUSE_NO_PRODUCT)
       return
 
     self._CreateThread(self._FuseVbootKey, selected_serials)
@@ -719,12 +1082,10 @@ class Atft(wx.Frame):
     """
     selected_serials = self._GetSelectedSerials()
     if not selected_serials:
-      self._SendAlertEvent("Can't Fuse permanent attributes! "
-                           'No target device selected!')
+      self._SendAlertEvent(self.ALERT_FUSE_PERM_NO_SELECTED)
       return
     if not self.atft_manager.product_info:
-      self._SendAlertEvent("Can't Fuse permanent Attributes! "
-                           'No product specified!')
+      self._SendAlertEvent(self.ALERT_FUSE_PERM_NO_PRODUCT)
       return
 
     self._CreateThread(self._FusePermAttr, selected_serials)
@@ -737,8 +1098,7 @@ class Atft(wx.Frame):
     """
     selected_serials = self._GetSelectedSerials()
     if not selected_serials:
-      self._SendAlertEvent("Can't Lock Android Verified Boot! "
-                           'No target device selected!')
+      self._SendAlertEvent(self.ALERT_LOCKAVB_NO_SELECTED)
       return
 
     self._CreateThread(self._LockAvb, selected_serials)
@@ -795,8 +1155,8 @@ class Atft(wx.Frame):
     Args:
       event: The triggering event.
     """
-    message = 'Choose Product Attributes File'
-    wildcard = '*.json'
+    message = self.DIALOG_CHOOSE_PRODUCT_ATTRIBUTE_FILE
+    wildcard = self.PRODUCT_ATTRIBUTE_FILE_EXTENSION
     callback = self.ProcessProductAttributesFile
     data = self.SelectFileArg(message, wildcard, callback)
     event = Event(self.select_file_event, value=data)
@@ -819,10 +1179,9 @@ class Atft(wx.Frame):
         if self.atft_manager.atfa_dev and self.atft_manager.product_info:
           self._CheckATFAStatus()
     except IOError:
-      self._SendAlertEvent('Can not open file ' + pathname)
+      self._SendAlertEvent(self.ALERT_CANNOT_OPEN_FILE + pathname)
     except ProductAttributesFileFormatError:
-      self._SendAlertEvent(
-          'The format for the product attributes file is not correct!')
+      self._SendAlertEvent(self.ALERT_PRODUCT_FILE_FORMAT_WRONG)
 
   def OnChangeKeyThreshold(self, event):
     """Change the threshold for low number of key warning.
@@ -830,7 +1189,7 @@ class Atft(wx.Frame):
     Args:
       event: The button click event.
     """
-    self.change_threshold_dialog.SetValue(str(self.atft_manager.key_threshold))
+    self.change_threshold_dialog.SetValue(str(self.key_threshold))
     self.change_threshold_dialog.CenterOnParent()
     if self.change_threshold_dialog.ShowModal() == wx.ID_OK:
       value = self.change_threshold_dialog.GetValue()
@@ -839,7 +1198,9 @@ class Atft(wx.Frame):
         if number <= 0:
           # Invalid setting, just ignore.
           return
-        self.atft_manager.key_threshold = number
+        self.key_threshold = number
+        # Update the configuration.
+        self.configs['DEFAULT_KEY_THRESHOLD'] = str(self.key_threshold)
       except ValueError:
         pass
 
@@ -875,7 +1236,7 @@ class Atft(wx.Frame):
     Args:
       event: The triggering event.
     """
-
+    self._StoreConfigToFile()
     # Stop the refresh timer on close.
     self.StopRefresh()
     self.Destroy()
@@ -886,11 +1247,14 @@ class Atft(wx.Frame):
     """
     # All idle devices -> waiting.
     for target_dev in self.atft_manager.target_devs:
-      if target_dev.provision_status == ProvisionStatus.IDLE:
+      if (target_dev.serial_number not in self.auto_dev_serials and
+          target_dev.provision_status != ProvisionStatus.PROVISION_SUCCESS and
+          not ProvisionStatus.isFailed(target_dev.provision_status)
+          ):
+        self.auto_dev_serials.append(target_dev.serial_number)
         target_dev.provision_status = ProvisionStatus.WAITING
+        self._CreateThread(self._HandleStateTransition, target_dev)
 
-    for target_dev in self.atft_manager.target_devs:
-      self._CreateThread(self._HandleStateTransition, target_dev)
 
   def _HandleKeysLeft(self):
     """Display how many keys left in the ATFA device.
@@ -920,7 +1284,7 @@ class Atft(wx.Frame):
       copy_list.append(dev.Copy())
     return copy_list
 
-  def _HandleException(self, e, operation=None, target=None):
+  def _HandleException(self, level, e, operation=None, target=None):
     """Handle the exception.
 
     Fires a exception event which would be handled in main thread. The exception
@@ -928,6 +1292,7 @@ class Atft(wx.Frame):
     associated operation and device object.
 
     Args:
+      level: The log level for the exception.
       e: The original exception.
       operation: The operation associated with this exception.
       target: The DeviceInfo object associated with this exception.
@@ -938,6 +1303,19 @@ class Atft(wx.Frame):
                       self.exception_event,
                       wx.ID_ANY,
                       value=str(atft_exception)))
+    self._LogException(level, atft_exception)
+
+  def _LogException(self, level, atft_exception):
+    """Log the exceptions.
+
+    Args:
+      level: The log level for this exception. 'E': error or 'W': warning.
+      atft_exception: The exception to be logged.
+    """
+    if level == 'E':
+      self.log.Error('OpException', str(atft_exception))
+    elif level == 'W':
+      self.log.Warning('OpException', str(atft_exception))
 
   def _CreateBindEvents(self):
     """Create customized events and bind them to the event handlers.
@@ -1016,6 +1394,7 @@ class Atft(wx.Frame):
       msg += '{' + str(target) + '} '
     msg += operation + ' Start'
     self._SendPrintEvent(msg)
+    self.log.Info('OpStart', msg)
 
   def _SendOperationSucceedEvent(self, operation, target=None):
     """Send an event to print an operation succeed message.
@@ -1029,6 +1408,7 @@ class Atft(wx.Frame):
       msg += '{' + str(target) + '} '
     msg += operation + ' Succeed'
     self._SendPrintEvent(msg)
+    self.log.Info('OpSucceed', msg)
 
   def _SendDeviceListedEvent(self):
     """Send an event to indicate device list is refreshed, need to refresh UI.
@@ -1060,15 +1440,6 @@ class Atft(wx.Frame):
       self.ShowAlert(msg)
       self.alert_lock.release()
 
-  def _MessageEventHandler(self, event):
-    """The handler to handle the event to display a message in the cmd output.
-
-    Args:
-      event: The message to be displayed.
-    """
-    msg = event.GetValue()
-    self.PrintToCmdWindow(msg)
-
   def _DeviceListedEventHandler(self, event):
     """Handles the device listed event and list the devices.
 
@@ -1079,14 +1450,14 @@ class Atft(wx.Frame):
     if self.atft_manager.atfa_dev:
       atfa_message = str(self.atft_manager.atfa_dev)
     else:
-      atfa_message = 'No devices found!'
+      atfa_message = self.ALERT_NO_DEVICE
 
     if self.auto_prov and not self.atft_manager.atfa_dev:
       # If ATFA unplugged during auto mode,
       # exit the mode with an alert.
       self.toolbar.ToggleTool(self.ID_TOOL_PROVISION, False)
       self.OnToggleAutoProv(None)
-      self._SendAlertEvent('ATFA device unplugged, exit auto mode!')
+      self._SendAlertEvent(self.ALERT_ATFA_UNPLUG)
 
     # If in auto provisioning mode, handle the newly added devices.
     if self.auto_prov:
@@ -1098,14 +1469,17 @@ class Atft(wx.Frame):
       return
 
     # Update the stored target list. Need to make a deep copy instead of copying
-    # the reference
+    # the reference.
     self.last_target_list = self._CopyList(self.atft_manager.target_devs)
     self.target_devs_output.DeleteAllItems()
-    if self.atft_manager.target_devs:
-      for target_dev in self.atft_manager.target_devs:
-        self.target_devs_output.Append(
-            (target_dev.serial_number, target_dev.location,
-             target_dev.provision_status))
+    for target_dev in self.atft_manager.target_devs:
+      provision_status_string = ProvisionStatus.ToString(
+          target_dev.provision_status, self.GetLanguageIndex())
+      # This is a utf-8 string, need to transfer to unicode.
+      provision_status_string = provision_status_string.decode('utf-8')
+      self.target_devs_output.Append(
+          (target_dev.serial_number, target_dev.location,
+           provision_status_string))
 
   def _SelectFileEventHandler(self, event):
     """Show the select file window.
@@ -1141,7 +1515,7 @@ class Atft(wx.Frame):
     self.low_key_alert_shown = True
     self.low_key_dialog.SetMessage(
         'The attestation keys available in this ATFA device is lower than ' +
-        str(self.atft_manager.key_threshold) + ' for this product!')
+        str(self.key_threshold) + ' for this product!')
     self.low_key_dialog.CenterOnParent()
     self.low_key_dialog.ShowModal()
 
@@ -1170,7 +1544,7 @@ class Atft(wx.Frame):
       try:
         self.atft_manager.ListDevices(self.sort_by)
       except FastbootFailure as e:
-        self._HandleException(e, operation)
+        self._HandleException('W', e, operation)
         return
       finally:
         # 'Release the lock'.
@@ -1194,10 +1568,13 @@ class Atft(wx.Frame):
       self.atft_manager.CheckATFAStatus()
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation)
+      self._HandleException('W', e, operation)
       return False
-    except (ProductNotSpecifiedException, FastbootFailure) as e:
-      self._HandleException(e, operation)
+    except ProductNotSpecifiedException as e:
+      self._HandleException('W', e, operation)
+      return False
+    except FastbootFailure as e:
+      self._HandleException('E', e, operation)
       return False
     finally:
       self.ResumeRefresh()
@@ -1225,13 +1602,11 @@ class Atft(wx.Frame):
       if not target:
         continue
       # Start state could be IDLE or FUSEVBOOT_FAILED
-      if (TEST_MODE or target.provision_status == ProvisionStatus.IDLE or
-          target.provision_status == ProvisionStatus.FUSEVBOOT_FAILED):
+      if (TEST_MODE or not target.provision_state.bootloader_locked):
         target.provision_status = ProvisionStatus.WAITING
         pending_targets.append(target)
       else:
-        self._SendAlertEvent('Cannot fuse bootloader vboot key for device'
-                             ' that is already fused!')
+        self._SendAlertEvent(self.ALERT_FUSE_VBOOT_FUSED)
 
     for target in pending_targets:
       self._FuseVbootKeyTarget(target)
@@ -1247,14 +1622,17 @@ class Atft(wx.Frame):
       target: The target device DeviceInfo object.
     """
     operation = 'Fuse bootloader verified boot key'
+    serial = target.serial_number
     self._SendOperationStartEvent(operation, target)
     self.PauseRefresh()
 
     try:
       self.atft_manager.FuseVbootKey(target)
-    except (ProductNotSpecifiedException, FastbootFailure) as e:
-      self._HandleException(e, operation)
+    except ProductNotSpecifiedException as e:
+      self._HandleException('W', e, operation)
       return
+    except FastbootFailure as e:
+      self._HandleException('E', e, operation)
     finally:
       self.ResumeRefresh()
 
@@ -1285,7 +1663,7 @@ class Atft(wx.Frame):
           target, self.REBOOT_TIMEOUT, LambdaSuccessCallback,
           LambdaTimeoutCallback)
     except FastbootFailure as e:
-      self._HandleException(e, operation)
+      self._HandleException('E', e, operation)
       return
     finally:
       self.listing_device_lock.release()
@@ -1293,6 +1671,13 @@ class Atft(wx.Frame):
     # Wait until callback finishes. After the callback, reboot_lock would be
     # released.
     reboot_lock.acquire()
+
+    target = self.atft_manager.GetTargetDevice(serial)
+    if target and not target.provision_state.bootloader_locked:
+      target.provision_status = ProvisionStatus.FUSEVBOOT_FAILED
+      e = FastbootFailure('Status not updated.')
+      self._HandleException('E', e, operation)
+      return
 
   def _RebootSuccessCallback(self, msg, lock):
     """The callback if reboot succeed.
@@ -1302,6 +1687,7 @@ class Atft(wx.Frame):
       lock: The lock to indicate the callback is called.
     """
     self._SendPrintEvent(msg)
+    self.log.Info('OpSucceed', msg)
     lock.release()
 
   def _RebootTimeoutCallback(self, msg, lock):
@@ -1312,7 +1698,7 @@ class Atft(wx.Frame):
       lock: The lock to indicate the callback is called.
     """
     self._SendPrintEvent(msg)
-    self._SendAlertEvent(msg)
+    self.log.Error('OpException', msg)
     lock.release()
 
   def _FusePermAttr(self, selected_serials):
@@ -1329,15 +1715,13 @@ class Atft(wx.Frame):
       # Start state could be FUSEVBOOT_SUCCESS or REBOOT_SUCCESS
       # or FUSEATTR_FAILED
       # Note: Reboot to check vboot is optional, user can skip that manually.
-      if (TEST_MODE or
-          target.provision_status == ProvisionStatus.FUSEVBOOT_SUCCESS or
-          target.provision_status == ProvisionStatus.REBOOT_SUCCESS or
-          target.provision_status == ProvisionStatus.FUSEATTR_FAILED):
+      if (TEST_MODE or (
+            target.provision_state.bootloader_locked and
+            not target.provision_state.avb_perm_attr_set
+          )):
         pending_targets.append(target)
       else:
-        self._SendAlertEvent('Cannot fuse permanent attributes for device'
-                             ' that is not fused bootloader vboot key or '
-                             'already fused permanent attributes!')
+        self._SendAlertEvent(self.ALERT_FUSE_PERM_ATTR_FUSED)
 
     for target in pending_targets:
       self._FusePermAttrTarget(target)
@@ -1354,8 +1738,11 @@ class Atft(wx.Frame):
 
     try:
       self.atft_manager.FusePermAttr(target)
-    except (ProductNotSpecifiedException, FastbootFailure) as e:
-      self._HandleException(e, operation)
+    except ProductNotSpecifiedException as e:
+      self._HandleException('W', e, operation)
+      return
+    except FastbootFailure as e:
+      self._HandleException('E', e, operation)
       return
     finally:
       self.ResumeRefresh()
@@ -1374,15 +1761,15 @@ class Atft(wx.Frame):
       if not target:
         continue
       # Start state could be FUSEATTR_SUCCESS or LOCKAVB_FAIELD
-      if (TEST_MODE or
-          target.provision_status == ProvisionStatus.FUSEATTR_SUCCESS or
-          target.provision_status == ProvisionStatus.LOCKAVB_FAILED):
+      if (TEST_MODE or(
+            target.provision_state.bootloader_locked and
+            target.provision_state.avb_perm_attr_set and
+            not target.provision_state.avb_locked
+          )):
         target.provision_status = ProvisionStatus.WAITING
         pending_targets.append(target)
       else:
-        self._SendAlertEvent('Cannot lock android verified boot for device'
-                             ' that is not fused permanent attributes or '
-                             'already locked!')
+        self._SendAlertEvent(self.ALERT_LOCKAVB_LOCKED)
 
     for target in pending_targets:
       self._LockAvbTarget(target)
@@ -1400,7 +1787,7 @@ class Atft(wx.Frame):
     try:
       self.atft_manager.LockAvb(target)
     except FastbootFailure as e:
-      self._HandleException(e, operation)
+      self._HandleException('E', e, operation)
       return
     finally:
       self.ResumeRefresh()
@@ -1413,11 +1800,11 @@ class Atft(wx.Frame):
     If so, an alert box would appear to warn the user.
     """
     operation = 'Check ATFA Status'
-    threshold = self.atft_manager.key_threshold
+    threshold = self.key_threshold
 
     if self._CheckATFAStatus():
       keys_left = self.atft_manager.GetATFAKeysLeft()
-      if keys_left and keys_left >=0 and keys_left <= threshold:
+      if keys_left and keys_left >= 0 and keys_left <= threshold:
         # If the confirmed number is lower than threshold, fire low key event.
         self._SendLowKeyAlertEvent()
 
@@ -1432,10 +1819,10 @@ class Atft(wx.Frame):
       self.atft_manager.SwitchATFAStorage()
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation)
+      self._HandleException('W', e, operation)
       return
     except FastbootFailure as e:
-      self._HandleException(e, operation, self.atft_manager.atfa_dev)
+      self._HandleException('E', e, operation, self.atft_manager.atfa_dev)
       return
     finally:
       self.ResumeRefresh()
@@ -1453,10 +1840,10 @@ class Atft(wx.Frame):
       self.atft_manager.RebootATFA()
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation)
+      self._HandleException('W', e, operation)
       return
     except FastbootFailure as e:
-      self._HandleException(e, operation, self.atft_manager.atfa_dev)
+      self._HandleException('E', e, operation, self.atft_manager.atfa_dev)
       return
     finally:
       self.ResumeRefresh()
@@ -1474,10 +1861,10 @@ class Atft(wx.Frame):
       self.atft_manager.ShutdownATFA()
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation)
+      self._HandleException('W', e, operation)
       return
     except FastbootFailure as e:
-      self._HandleException(e, operation, self.atft_manager.atfa_dev)
+      self._HandleException('E', e, operation, self.atft_manager.atfa_dev)
       return
     finally:
       self.ResumeRefresh()
@@ -1499,12 +1886,15 @@ class Atft(wx.Frame):
         continue
       pending_targets.append(target_dev)
       status = target_dev.provision_status
-      if (TEST_MODE or status == ProvisionStatus.LOCKAVB_SUCCESS or
-          status == ProvisionStatus.PROVISION_FAILED):
+      if (TEST_MODE or (
+          target_dev.provision_state.bootloader_locked and
+          target_dev.provision_state.avb_perm_attr_set and
+          target_dev.provision_state.avb_locked and
+          not target_dev.provision_state.provisioned
+        )):
         target_dev.provision_status = ProvisionStatus.WAITING
       else:
-        self._SendAlertEvent('Cannot provision device'
-                             ' that is not ready for provisioning!')
+        self._SendAlertEvent(self.ALERT_PROV_PROVED)
     for target in pending_targets:
       if target.provision_status == ProvisionStatus.WAITING:
         self._ProvisionTarget(target)
@@ -1523,12 +1913,12 @@ class Atft(wx.Frame):
       self.atft_manager.Provision(target)
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation, target)
+      self._HandleException('W', e, operation, target)
       return
     except FastbootFailure as e:
-      self._HandleException(e, operation, target)
+      self._HandleException('E', e, operation, target)
       # If it fails, one key might also be used.
-      self._CheckLowKeyAlert()
+      self._CheckATFAStatus()
       return
     finally:
       self.ResumeRefresh()
@@ -1547,27 +1937,33 @@ class Atft(wx.Frame):
       target: The target device object.
     """
     self.auto_prov_lock.acquire()
-    while target.provision_status != ProvisionStatus.PROVISION_SUCCESS:
-      if target.provision_status == ProvisionStatus.WAITING:
-        self._FuseVbootKeyTarget(target)
-        if (target.provision_status == ProvisionStatus.FUSEVBOOT_FAILED or
-            target.provision_status == ProvisionStatus.REBOOT_FAILED):
-          break
-      elif (target.provision_status == ProvisionStatus.FUSEVBOOT_SUCCESS or
-            target.provision_status == ProvisionStatus.REBOOT_SUCCESS):
-        self._FusePermAttrTarget(target)
-        if target.provision_status == ProvisionStatus.FUSEATTR_FAILED:
-          break
-      elif target.provision_status == ProvisionStatus.FUSEATTR_SUCCESS:
-        self._LockAvbTarget(target)
-        if target.provision_status == ProvisionStatus.LOCKAVB_FAILED:
-          break
-      elif target.provision_status == ProvisionStatus.LOCKAVB_SUCCESS:
-        self._ProvisionTarget(target)
-        if target.provision_status == ProvisionStatus.PROVISION_FAILED:
-          break
-      else:
+    serial = target.serial_number
+    while not ProvisionStatus.isFailed(target.provision_status):
+      target = self.atft_manager.GetTargetDevice(serial)
+      if not target:
+        # The target disappear somehow.
         break
+      if not self.auto_prov:
+        # Auto provision mode exited.
+        break
+      if not target.provision_state.bootloader_locked:
+        self._FuseVbootKeyTarget(target)
+        continue
+      elif not target.provision_state.avb_perm_attr_set:
+        self._FusePermAttrTarget(target)
+        continue
+      elif not target.provision_state.avb_locked:
+        self._LockAvbTarget(target)
+        continue
+      elif not target.provision_state.provisioned:
+        self._ProvisionTarget(target)
+        if self.atft_manager.GetATFAKeysLeft() == 0:
+          # No keys left. If it's auto provisioning mode, exit.
+          self._SendAlertEvent(self.ALERT_NO_KEYS_LEFT_LEAVE_PROV)
+          self.toolbar.ToggleTool(self.ID_TOOL_PROVISION, False)
+          self.OnToggleAutoProv(None)
+      break
+    self.auto_dev_serials.remove(serial)
     self.auto_prov_lock.release()
 
   def _ProcessKey(self):
@@ -1581,10 +1977,10 @@ class Atft(wx.Frame):
       self.atft_manager.ProcessATFAKey()
     except DeviceNotFoundException as e:
       e.SetMsg('No Available ATFA!')
-      self._HandleException(e, operation)
+      self._HandleException('W', e, operation)
       return
     except FastbootFailure as e:
-      self._HandleException(e, operation)
+      self._HandleException('E', e, operation)
       return
     finally:
       self.ResumeRefresh()

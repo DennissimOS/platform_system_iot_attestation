@@ -42,7 +42,7 @@ class FastbootDevice(object):
   """
 
   current_path = _GetCurrentPath()
-  fastboot_command = os.path.join(current_path, 'fastboot')
+  fastboot_command = os.path.join(current_path, 'fastboot.exe')
   HOST_OS = 'Windows'
 
   @staticmethod
@@ -104,21 +104,39 @@ class FastbootDevice(object):
     """
     try:
       self._lock.acquire()
-      if err_to_out:
-        return subprocess.check_output(
-            [
-                FastbootDevice.fastboot_command, '-s', self.serial_number,
-                'oem', oem_command
-            ],
-            stderr=subprocess.STDOUT,
-            creationflags=CREATE_NO_WINDOW)
-      else:
-        return subprocess.check_output(
-            [
-                FastbootDevice.fastboot_command, '-s', self.serial_number,
-                'oem', oem_command
-            ],
-            creationflags=CREATE_NO_WINDOW)
+      # We need to redirect the output no matter err_to_out is set
+      # So that FastbootFailure can catch the right error.
+      return subprocess.check_output(
+          [
+              FastbootDevice.fastboot_command, '-s', self.serial_number,
+              'oem', oem_command
+          ],
+          stderr=subprocess.STDOUT,
+          creationflags=CREATE_NO_WINDOW)
+    except subprocess.CalledProcessError as e:
+      raise fastboot_exceptions.FastbootFailure(e.output)
+    finally:
+      self._lock.release()
+
+  def Flash(self, partition, file_path):
+    """Flash a file to a partition.
+
+    Args:
+      file_path: The partition file to be flashed.
+      partition: The partition to be flashed.
+    Returns:
+      The output for the fastboot command required.
+    Raises:
+      FastbootFailure: If failure happens during the command.
+    """
+    try:
+      self._lock.acquire()
+      return subprocess.check_output(
+          [
+              FastbootDevice.fastboot_command, '-s', self.serial_number,
+              'flash', partition, file_path
+          ],
+          creationflags=CREATE_NO_WINDOW)
     except subprocess.CalledProcessError as e:
       raise fastboot_exceptions.FastbootFailure(e.output)
     finally:

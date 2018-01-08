@@ -13,10 +13,12 @@
 # limitations under the License.
 
 """Unit test for atft."""
+import types
 import unittest
 
 import atft
 from atftman import ProvisionStatus
+from atftman import ProvisionState
 import fastboot_exceptions
 from mock import call
 from mock import MagicMock
@@ -27,10 +29,28 @@ import wx
 class MockAtft(atft.Atft):
 
   def __init__(self):
-    atft.Atft.InitializeUI = MagicMock()
-    atft.Atft.__init__(self)
-    self.atft_manager = MagicMock()
+    self.InitializeUI = MagicMock()
+    self.StartRefreshingDevices = MagicMock()
+    self.ChooseProduct = MagicMock()
+    self.CreateAtftManager = MagicMock()
+    self.CreateAtftLog = MagicMock()
+    self.ParseConfigFile = self._MockParseConfig
     self._SendPrintEvent = MagicMock()
+    atft.Atft.__init__(self)
+
+  def _MockParseConfig(self):
+    self.ATFT_VERSION = 'vTest'
+    self.COMPATIBLE_ATFA_VERSION = 'v1'
+    self.DEVICE_REFRESH_INTERVAL = 1.0
+    self.DEFAULT_KEY_THRESHOLD = 0
+    self.LOG_DIR = 'test_log_dir'
+    self.LOG_SIZE = 1000
+    self.LOG_FILE_NUMBER = 2
+    self.LANGUAGE = 'ENG'
+    self.REBOOT_TIMEOUT = 1.0
+    self.PRODUCT_ATTRIBUTE_FILE_EXTENSION = '*.atpa'
+
+    return {}
 
 
 class TestDeviceInfo(object):
@@ -39,6 +59,7 @@ class TestDeviceInfo(object):
     self.serial_number = serial_number
     self.location = location
     self.provision_status = provision_status
+    self.provision_state = ProvisionState()
     self.time_set = False
 
   def __eq__(self, other):
@@ -65,8 +86,10 @@ class AtftTest(unittest.TestCase):
 
   def setUp(self):
     self.test_target_devs = []
-    self.test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1)
-    self.test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2)
+    self.test_dev1 = TestDeviceInfo(
+        self.TEST_SERIAL1, self.TEST_LOCATION1, ProvisionStatus.IDLE)
+    self.test_dev2 = TestDeviceInfo(
+        self.TEST_SERIAL2, self.TEST_LOCATION2, ProvisionStatus.IDLE)
     self.test_text_window = ''
     self.atfa_keys = None
     self.device_map = {}
@@ -190,6 +213,8 @@ class AtftTest(unittest.TestCase):
   @patch('wx.QueueEvent')
   def testStartRefreshingDevice(self, mock_queue_event, mock_timer):
     mock_atft = MockAtft()
+    mock_atft.StartRefreshingDevices = types.MethodType(
+        atft.Atft.StartRefreshingDevices, mock_atft, atft.Atft)
     mock_atft.DEVICE_REFRESH_INTERVAL = 0.01
     mock_atft._ListDevices = MagicMock()
     mock_atft.dev_listed_event = MagicMock()
@@ -204,6 +229,8 @@ class AtftTest(unittest.TestCase):
   @patch('threading.Timer')
   def testPauseResumeRefreshingDevice(self, mock_timer):
     mock_atft = MockAtft()
+    mock_atft.StartRefreshingDevices = types.MethodType(
+        atft.Atft.StartRefreshingDevices, mock_atft, atft.Atft)
     mock_atft.DEVICE_REFRESH_INTERVAL = 0.01
     mock_atft._ListDevices = MagicMock()
     mock_atft.dev_listed_event = MagicMock()
@@ -222,6 +249,8 @@ class AtftTest(unittest.TestCase):
   # Test atft.OnToggleAutoProv
   def testOnEnterAutoProvNormal(self):
     mock_atft = MockAtft()
+    mock_atft.StartRefreshingDevices = types.MethodType(
+        atft.Atft.StartRefreshingDevices, mock_atft, atft.Atft)
     mock_atft.toolbar = MagicMock()
     mock_atft.toolbar_auto_provision = MagicMock()
     mock_atft.toolbar_auto_provision.IsToggled.return_value = True
@@ -287,11 +316,15 @@ class AtftTest(unittest.TestCase):
                                ProvisionStatus.WAITING)
     mock_atft.atft_manager.target_devs.append(test_dev1)
     mock_atft.atft_manager.target_devs.append(test_dev2)
+    mock_atft.atft_manager.CheckProvisionStatus.side_effect = (
+        lambda target=test_dev2, state=ProvisionStatus.LOCKAVB_SUCCESS:
+        self.MockStateChange(target, state))
     mock_atft.OnToggleAutoProv(None)
     self.assertEqual(False, mock_atft.auto_prov)
     self.assertEqual(test_dev1.provision_status,
                      ProvisionStatus.PROVISION_SUCCESS)
-    self.assertEqual(test_dev2.provision_status, ProvisionStatus.IDLE)
+    mock_atft.atft_manager.CheckProvisionStatus.assert_called_once()
+    self.assertEqual(test_dev2.provision_status, ProvisionStatus.LOCKAVB_SUCCESS)
 
   # Test atft.OnChangeKeyThreshold
   def testOnChangeKeyThreshold(self):
@@ -300,22 +333,22 @@ class AtftTest(unittest.TestCase):
     mock_atft.change_threshold_dialog.ShowModal.return_value = wx.ID_OK
     mock_atft.change_threshold_dialog.GetValue.return_value = '100'
     mock_atft.OnChangeKeyThreshold(None)
-    self.assertEqual(100, mock_atft.atft_manager.key_threshold)
+    self.assertEqual(100, mock_atft.key_threshold)
 
   def testOnChangeKeyThresholdNotInt(self):
     mock_atft = MockAtft()
-    mock_atft.atft_manager.key_threshold = 100
+    mock_atft.key_threshold = 100
     mock_atft.change_threshold_dialog = MagicMock()
     mock_atft.change_threshold_dialog.ShowModal.return_value = wx.ID_OK
     mock_atft.change_threshold_dialog.GetValue.return_value = 'ABC'
     mock_atft.OnChangeKeyThreshold(None)
-    self.assertEqual(100, mock_atft.atft_manager.key_threshold)
+    self.assertEqual(100, mock_atft.key_threshold)
     mock_atft.change_threshold_dialog.GetValue.return_value = '2'
     mock_atft.OnChangeKeyThreshold(None)
-    self.assertEqual(2, mock_atft.atft_manager.key_threshold)
+    self.assertEqual(2, mock_atft.key_threshold)
     mock_atft.change_threshold_dialog.GetValue.return_value = '-10'
     mock_atft.OnChangeKeyThreshold(None)
-    self.assertEqual(2, mock_atft.atft_manager.key_threshold)
+    self.assertEqual(2, mock_atft.key_threshold)
 
   # Test atft._HandleAutoProv
   def testHandleAutoProv(self):
@@ -331,7 +364,7 @@ class AtftTest(unittest.TestCase):
     mock_atft._HandleStateTransition = MagicMock()
     mock_atft._HandleAutoProv()
     self.assertEqual(test_dev2.provision_status, ProvisionStatus.WAITING)
-    self.assertEqual(2, mock_atft._CreateThread.call_count)
+    self.assertEqual(1, mock_atft._CreateThread.call_count)
 
   # Test atft._HandleKeysLeft
   def MockGetKeysLeft(self, keys_left_array):
@@ -379,6 +412,14 @@ class AtftTest(unittest.TestCase):
   # Test atft._HandleStateTransition
   def MockStateChange(self, target, state):
     target.provision_status = state
+    if state == ProvisionStatus.REBOOT_SUCCESS:
+      target.provision_state.bootloader_locked = True
+    if state == ProvisionStatus.FUSEATTR_SUCCESS:
+      target.provision_state.avb_perm_attr_set = True
+    if state == ProvisionStatus.LOCKAVB_SUCCESS:
+      target.provision_state.avb_locked = True
+    if state == ProvisionStatus.PROVISION_SUCCESS:
+      target.provision_state.provisioned = True
 
   def testHandleStateTransition(self):
     mock_atft = MockAtft()
@@ -400,6 +441,11 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
         self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.PROVISION_SUCCESS,
                      test_dev1.provision_status)
@@ -424,6 +470,11 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
             self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.FUSEVBOOT_FAILED,
                      test_dev1.provision_status)
@@ -448,6 +499,11 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
         self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.REBOOT_FAILED, test_dev1.provision_status)
 
@@ -471,6 +527,11 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
         self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.FUSEATTR_FAILED,
                      test_dev1.provision_status)
@@ -495,6 +556,11 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
         self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.LOCKAVB_FAILED, test_dev1.provision_status)
 
@@ -518,9 +584,54 @@ class AtftTest(unittest.TestCase):
     mock_atft._ProvisionTarget.side_effect = (
         lambda target=mock_atft, state=ProvisionStatus.PROVISION_FAILED:
         self.MockStateChange(target, state))
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
     mock_atft._HandleStateTransition(test_dev1)
     self.assertEqual(ProvisionStatus.PROVISION_FAILED,
                      test_dev1.provision_status)
+
+  def testHandleStateTransitionSkipStep(self):
+    mock_atft = MockAtft()
+    test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
+                               ProvisionStatus.WAITING)
+    mock_atft._FuseVbootKeyTarget = MagicMock()
+    mock_atft._FuseVbootKeyTarget.side_effect = (
+        lambda target=mock_atft, state=ProvisionStatus.REBOOT_SUCCESS:
+        self.MockStateChange(target, state))
+    mock_atft._FusePermAttrTarget = MagicMock()
+    mock_atft._FusePermAttrTarget.side_effect = (
+        lambda target=mock_atft, state=ProvisionStatus.FUSEATTR_SUCCESS:
+        self.MockStateChange(target, state))
+    mock_atft._LockAvbTarget = MagicMock()
+    mock_atft._LockAvbTarget.side_effect = (
+        lambda target=mock_atft, state=ProvisionStatus.LOCKAVB_SUCCESS:
+        self.MockStateChange(target, state))
+    mock_atft._ProvisionTarget = MagicMock()
+    mock_atft._ProvisionTarget.side_effect = (
+        lambda target=mock_atft, state=ProvisionStatus.PROVISION_SUCCESS:
+        self.MockStateChange(target, state))
+
+    # The device has bootloader_locked and avb_locked set. Should fuse perm attr
+    # and provision key.
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_locked = True
+    mock_atft.auto_dev_serials = [self.TEST_SERIAL1]
+    mock_atft.auto_prov = True
+    mock_atft.atft_manager = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice = MagicMock()
+    mock_atft.atft_manager.GetTargetDevice.return_value = test_dev1
+    mock_atft._HandleStateTransition(test_dev1)
+    self.assertEqual(ProvisionStatus.PROVISION_SUCCESS,
+                     test_dev1.provision_status)
+    mock_atft._FusePermAttrTarget.assert_called_once()
+    mock_atft._ProvisionTarget.assert_called_once()
+    self.assertEqual(True, test_dev1.provision_state.bootloader_locked)
+    self.assertEqual(True, test_dev1.provision_state.avb_perm_attr_set)
+    self.assertEqual(True, test_dev1.provision_state.avb_locked)
+    self.assertEqual(True, test_dev1.provision_state.provisioned)
 
   # Test atft._CheckATFAStatus
   def testCheckATFAStatus(self):
@@ -538,6 +649,7 @@ class AtftTest(unittest.TestCase):
 
   def MockReboot(self, target, timeout, success, fail):
     success()
+    target.provision_state.bootloader_locked = True
 
   @patch('wx.QueueEvent')
   def testFuseVbootKey(self, mock_queue_event):
@@ -557,6 +669,7 @@ class AtftTest(unittest.TestCase):
                                ProvisionStatus.FUSEVBOOT_FAILED)
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -586,6 +699,7 @@ class AtftTest(unittest.TestCase):
                                ProvisionStatus.FUSEVBOOT_FAILED)
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -605,6 +719,7 @@ class AtftTest(unittest.TestCase):
                                ProvisionStatus.FUSEVBOOT_FAILED)
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -622,6 +737,7 @@ class AtftTest(unittest.TestCase):
                                ProvisionStatus.FUSEVBOOT_FAILED)
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -643,14 +759,23 @@ class AtftTest(unittest.TestCase):
     mock_atft._SendMessageEvent = MagicMock()
     mock_atft.atft_manager.GetTargetDevice.side_effect = (
         self.MockGetTargetDevice)
-    test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
-                               ProvisionStatus.FUSEVBOOT_SUCCESS)
-    test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
-                               ProvisionStatus.REBOOT_SUCCESS)
-    test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
-                               ProvisionStatus.FUSEATTR_FAILED)
-    test_dev4 = TestDeviceInfo(self.TEST_SERIAL4, self.TEST_LOCATION2,
-                               ProvisionStatus.FUSEATTR_SUCCESS)
+    test_dev1 = TestDeviceInfo(
+        self.TEST_SERIAL1, self.TEST_LOCATION1,
+        ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev2 = TestDeviceInfo(
+        self.TEST_SERIAL2, self.TEST_LOCATION2,
+        ProvisionStatus.REBOOT_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev3 = TestDeviceInfo(
+        self.TEST_SERIAL3, self.TEST_LOCATION2,
+        ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
+    test_dev4 = TestDeviceInfo(
+        self.TEST_SERIAL4, self.TEST_LOCATION2,
+        ProvisionStatus.FUSEATTR_SUCCESS)
+    test_dev4.provision_state.bootloader_locked = True
+    test_dev4.provision_state.avb_perm_attr_set = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -676,12 +801,17 @@ class AtftTest(unittest.TestCase):
         self.MockGetTargetDevice)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev1.provision_state.bootloader_locked = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.REBOOT_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
     test_dev4 = TestDeviceInfo(self.TEST_SERIAL4, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_SUCCESS)
+    test_dev4.provision_state.bootloader_locked = True
+    test_dev4.provision_state.avb_perm_attr_set = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -698,10 +828,13 @@ class AtftTest(unittest.TestCase):
     mock_atft._HandleException.reset_mock()
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.FUSEVBOOT_SUCCESS)
+    test_dev1.provision_state.bootloader_locked = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.REBOOT_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
     test_dev4 = TestDeviceInfo(self.TEST_SERIAL4, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_SUCCESS)
     self.device_map[self.TEST_SERIAL1] = test_dev1
@@ -727,10 +860,16 @@ class AtftTest(unittest.TestCase):
         self.MockGetTargetDevice)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.FUSEATTR_SUCCESS)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_perm_attr_set = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.LOCKAVB_FAILED)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev2.provision_state.avb_perm_attr_set = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
+    test_dev3.provision_state.avb_perm_attr_set = False
     test_dev4 = TestDeviceInfo(self.TEST_SERIAL4, self.TEST_LOCATION2,
                                ProvisionStatus.IDLE)
     self.device_map[self.TEST_SERIAL1] = test_dev1
@@ -758,10 +897,16 @@ class AtftTest(unittest.TestCase):
         self.MockGetTargetDevice)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.FUSEATTR_SUCCESS)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_perm_attr_set = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.LOCKAVB_FAILED)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev2.provision_state.avb_perm_attr_set = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
+    test_dev3.provision_state.avb_perm_attr_set = False
     test_dev4 = TestDeviceInfo(self.TEST_SERIAL4, self.TEST_LOCATION2,
                                ProvisionStatus.IDLE)
     self.device_map[self.TEST_SERIAL1] = test_dev1
@@ -794,7 +939,7 @@ class AtftTest(unittest.TestCase):
     mock_atft._SendStartMessageEvent = MagicMock()
     mock_atft._SendSucceedMessageEvent = MagicMock()
     mock_atft._SendLowKeyAlertEvent = MagicMock()
-    mock_atft.atft_manager.key_threshold = 100
+    mock_atft.key_threshold = 100
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.WAITING)
     mock_atft.atft_manager.GetATFAKeysLeft.side_effect = (
@@ -822,7 +967,7 @@ class AtftTest(unittest.TestCase):
     mock_atft._SendStartMessageEvent = MagicMock()
     mock_atft._SendSucceedMessageEvent = MagicMock()
     mock_atft._SendLowKeyAlertEvent = MagicMock()
-    mock_atft.atft_manager.key_threshold = 100
+    mock_atft.key_threshold = 100
     mock_atft._HandleException = MagicMock()
     mock_atft.atft_manager.CheckATFAStatus.side_effect = (
         fastboot_exceptions.FastbootFailure(''))
@@ -935,10 +1080,17 @@ class AtftTest(unittest.TestCase):
         self.MockGetTargetDevice)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.PROVISION_FAILED)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_perm_attr_set = True
+    test_dev1.provision_state.avb_locked = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.LOCKAVB_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev2.provision_state.avb_perm_attr_set = True
+    test_dev2.provision_state.avb_locked = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -961,10 +1113,17 @@ class AtftTest(unittest.TestCase):
         self.MockGetTargetDevice)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.PROVISION_FAILED)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_perm_attr_set = True
+    test_dev1.provision_state.avb_locked = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.LOCKAVB_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev2.provision_state.avb_perm_attr_set = True
+    test_dev2.provision_state.avb_locked = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3
@@ -975,10 +1134,17 @@ class AtftTest(unittest.TestCase):
     self.assertEqual(2, mock_atft._HandleException.call_count)
     test_dev1 = TestDeviceInfo(self.TEST_SERIAL1, self.TEST_LOCATION1,
                                ProvisionStatus.PROVISION_FAILED)
+    test_dev1.provision_state.bootloader_locked = True
+    test_dev1.provision_state.avb_perm_attr_set = True
+    test_dev1.provision_state.avb_locked = True
     test_dev2 = TestDeviceInfo(self.TEST_SERIAL2, self.TEST_LOCATION2,
                                ProvisionStatus.LOCKAVB_SUCCESS)
+    test_dev2.provision_state.bootloader_locked = True
+    test_dev2.provision_state.avb_perm_attr_set = True
+    test_dev2.provision_state.avb_locked = True
     test_dev3 = TestDeviceInfo(self.TEST_SERIAL3, self.TEST_LOCATION2,
                                ProvisionStatus.FUSEATTR_FAILED)
+    test_dev3.provision_state.bootloader_locked = True
     self.device_map[self.TEST_SERIAL1] = test_dev1
     self.device_map[self.TEST_SERIAL2] = test_dev2
     self.device_map[self.TEST_SERIAL3] = test_dev3

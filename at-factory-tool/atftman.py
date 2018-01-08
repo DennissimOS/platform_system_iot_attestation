@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
 # Copyright 2017 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +23,7 @@ import base64
 from datetime import datetime
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -43,23 +45,65 @@ class EncryptionAlgorithm(object):
 
 class ProvisionStatus(object):
   """The provision status constant."""
-  IDLE              = 'Idle'
-  WAITING           = 'Waiting'
-  FUSEVBOOT_ING     = 'Fusing Bootloader Vboot Key'
-  FUSEVBOOT_SUCCESS = 'Bootloader Locked'
-  FUSEVBOOT_FAILED  = 'Fuse Bootloader Vboot Key Failed'
-  REBOOT_ING        = 'Rebooting Device To Check Vboot Key'
-  REBOOT_SUCCESS    = 'Bootloader Verified Boot Checked'
-  REBOOT_FAILED     = 'Reboot Device Failed'
-  FUSEATTR_ING      = 'Fusing Permanent Attributes'
-  FUSEATTR_SUCCESS  = 'Permanent Attributes Fused'
-  FUSEATTR_FAILED   = 'Fuse Permanent Attributes Failed'
-  LOCKAVB_ING       = 'Locking Android Verified Boot'
-  LOCKAVB_SUCCESS   = 'Android Verified Boot Locked'
-  LOCKAVB_FAILED    = 'Lock Android Verified Boot Failed'
-  PROVISION_ING     = 'Provisioning Attestation Key'
-  PROVISION_SUCCESS = 'Attestation Key Provisioned'
-  PROVISION_FAILED  = 'Provision Attestation Key Failed'
+  _PROCESSING        = 0
+  _SUCCESS           = 1
+  _FAILED            = 2
+
+  IDLE              = 0
+  WAITING           = 1
+  FUSEVBOOT_ING     = (10 + _PROCESSING)
+  FUSEVBOOT_SUCCESS = (10 + _SUCCESS)
+  FUSEVBOOT_FAILED  = (10 + _FAILED)
+  REBOOT_ING        = (20 + _PROCESSING)
+  REBOOT_SUCCESS    = (20 + _SUCCESS)
+  REBOOT_FAILED     = (20 + _FAILED)
+  FUSEATTR_ING      = (30 + _PROCESSING)
+  FUSEATTR_SUCCESS  = (30 + _SUCCESS)
+  FUSEATTR_FAILED   = (30 + _FAILED)
+  LOCKAVB_ING       = (40 + _PROCESSING)
+  LOCKAVB_SUCCESS   = (40 + _SUCCESS)
+  LOCKAVB_FAILED    = (40 + _FAILED)
+  PROVISION_ING     = (50 + _PROCESSING)
+  PROVISION_SUCCESS = (50 + _SUCCESS)
+  PROVISION_FAILED  = ( + _FAILED)
+
+  STRING_MAP = {
+    IDLE              : ['Idle', '初始'],
+    WAITING           : ['Waiting', '等待'],
+    FUSEVBOOT_ING     : ['Fusing Bootloader Vboot Key...', '烧录引导密钥中...'],
+    FUSEVBOOT_SUCCESS : ['Bootloader Locked', '烧录引导密钥成功'],
+    FUSEVBOOT_FAILED  : ['Fuse Bootloader Vboot Key Failed', '烧录引导密钥失败'],
+    REBOOT_ING        : ['Rebooting Device To Check Vboot Key...',
+                         '重启设备中...'],
+    REBOOT_SUCCESS    : ['Bootloader Verified Boot Checked', '重启设备成功'],
+    REBOOT_FAILED     : ['Reboot Device Failed', '重启设备失败'],
+    FUSEATTR_ING      : ['Fusing Permanent Attributes', '烧录产品信息中...'],
+    FUSEATTR_SUCCESS  : ['Permanent Attributes Fused', '烧录产品信息成功'],
+    FUSEATTR_FAILED   : ['Fuse Permanent Attributes Failed', '烧录产品信息失败'],
+    LOCKAVB_ING       : ['Locking Android Verified Boot', '锁定AVB中...'],
+    LOCKAVB_SUCCESS   : ['Android Verified Boot Locked', '锁定AVB成功'],
+    LOCKAVB_FAILED    : ['Lock Android Verified Boot Failed', '锁定AVB失败'],
+    PROVISION_ING     : ['Provisioning Attestation Key', '传输密钥中...'],
+    PROVISION_SUCCESS : ['Attestation Key Provisioned', '传输密钥成功'],
+    PROVISION_FAILED  : ['Provision Attestation Key Failed', '传输密钥失败']
+
+  }
+
+  @staticmethod
+  def ToString(provision_status, language_index):
+    return ProvisionStatus.STRING_MAP[provision_status][language_index]
+
+  @staticmethod
+  def isSuccess(provision_status):
+    return provision_status % 10 == ProvisionStatus._SUCCESS
+
+  @staticmethod
+  def isProcessing(provision_status):
+    return provision_status % 10 == ProvisionStatus._PROCESSING
+
+  @staticmethod
+  def isFailed(provision_status):
+    return provision_status % 10 == ProvisionStatus._FAILED
 
 
 class ProvisionState(object):
@@ -118,6 +162,9 @@ class DeviceInfo(object):
   def Oem(self, oem_command, err_to_out=False):
     return self._fastboot_device_controller.Oem(oem_command, err_to_out)
 
+  def Flash(self, partition, file_path):
+    return self._fastboot_device_controller.Flash(partition, file_path)
+
   def Upload(self, file_path):
     return self._fastboot_device_controller.Upload(file_path)
 
@@ -145,7 +192,8 @@ class DeviceInfo(object):
 class RebootCallback(object):
   """The class to handle reboot success and timeout callbacks."""
 
-  def __init__(self, timeout, success_callback, timeout_callback):
+  def __init__(
+      self, timeout, success_callback, timeout_callback):
     """Initiate a reboot callback handler class.
 
     Args:
@@ -168,14 +216,16 @@ class RebootCallback(object):
 
     Call the timeout_callback that is registered.
     """
-    if self.lock.acquire(False):
+    if self.lock and self.lock.acquire(False):
       self.fail()
 
   def Release(self):
-    self.lock.release()
-    self.timer.cancel()
+    lock = self.lock
+    timer = self.timer
     self.lock = None
     self.timer = None
+    lock.release()
+    timer.cancel()
 
 
 class AtftManager(object):
@@ -188,11 +238,8 @@ class AtftManager(object):
   """
   SORT_BY_SERIAL = 0
   SORT_BY_LOCATION = 1
-  DEFAULT_KEY_THRESHOLD = 100
   # The length of the permanent attribute should be 1052.
   EXPECTED_ATTRIBUTE_LENGTH = 1052
-
-  ATFA_REBOOT_TIMEOUT = 30
 
   # The Permanent Attribute File JSON Key Names:
   JSON_PRODUCT_NAME = 'productName'
@@ -200,7 +247,7 @@ class AtftManager(object):
   JSON_PRODUCT_ATTRIBUTE = 'productPermanentAttribute'
   JSON_VBOOT_KEY = 'bootloaderPublicKey'
 
-  def __init__(self, fastboot_device_controller, serial_mapper):
+  def __init__(self, fastboot_device_controller, serial_mapper, configs):
     """Initialize attributes and store the supplied fastboot_device_controller.
 
     Args:
@@ -208,7 +255,17 @@ class AtftManager(object):
         The interface to interact with a fastboot device.
       serial_mapper:
         The interface to get the USB physical location to serial number map.
+      configs:
+        The additional configurations. Need to contain 'ATFA_REBOOT_TIMEOUT'.
     """
+    # The timeout period for ATFA device reboot.
+    self.ATFA_REBOOT_TIMEOUT = 30
+    if configs and 'ATFA_REBOOT_TIMEOUT' in configs:
+      try:
+        self.ATFA_REBOOT_TIMEOUT = float(configs['ATFA_REBOOT_TIMEOUT'])
+      except ValueError:
+        pass
+
     # The serial numbers for the devices that are at least seen twice.
     self.stable_serials = []
     # The serail numbers for the devices that are only seen once.
@@ -221,9 +278,6 @@ class AtftManager(object):
     self.target_devs = []
     # The product information for the selected product.
     self.product_info = None
-    # The key threshold, if the number of attestation key in the ATFA device
-    # is lower than this number, an alert would appear.
-    self.key_threshold = self.DEFAULT_KEY_THRESHOLD
      # The atfa device manager.
     self._atfa_dev_manager = AtfaDeviceManager(self)
     # The fastboot controller.
@@ -249,6 +303,8 @@ class AtftManager(object):
       # Only windows need to switch. For Linux the partition should already
       # mounted.
       self._atfa_dev_manager.SwitchStorage()
+    else:
+      self.CheckDevice(self.atfa_dev)
 
   def RebootATFA(self):
     return self._atfa_dev_manager.Reboot()
@@ -271,8 +327,8 @@ class AtftManager(object):
     # ListDevices returns a list of USBHandles
     device_serials = self._fastboot_device_controller.ListDevices()
     self.UpdateDevices(device_serials)
-    self._SortTargetDevices(sort_by)
     self._HandleRebootCallbacks()
+    self._SortTargetDevices(sort_by)
 
   def UpdateDevices(self, device_serials):
     """Update device list.
@@ -360,7 +416,6 @@ class AtftManager(object):
     Add device location information and target device provision status.
     """
     device_serials = self.stable_serials
-    serial_location_map = self._serial_mapper.get_serial_map()
     new_targets = []
     atfa_serial = None
     for serial in device_serials:
@@ -378,25 +433,45 @@ class AtftManager(object):
     elif self.atfa_dev is None or self.atfa_dev.serial_number != atfa_serial:
       self._AddNewAtfa(atfa_serial)
 
-    # Remove those devices that are not in new targets.
+    # Remove those devices that are not in new targets and not rebooting.
     self.target_devs = [
         device for device in self.target_devs
-        if device.serial_number in new_targets
+        if (device.serial_number in new_targets or
+            device.provision_status == ProvisionStatus.REBOOT_ING)
     ]
 
     common_serials = [device.serial_number for device in self.target_devs]
 
     # Create new device object for newly added devices.
+    serial_location_map = self._serial_mapper.get_serial_map()
     for serial in new_targets:
       if serial not in common_serials:
-        controller = self._fastboot_device_controller(serial)
-        location = None
-        if serial in serial_location_map:
-          location = serial_location_map[serial]
+        self._CreateNewTargetDevice(serial, serial_location_map)
 
-        new_target_dev = DeviceInfo(controller, serial, location)
+  def _CreateNewTargetDevice(
+      self, serial, serial_location_map, check_status=True):
+    """Create a new target device object.
+
+    Args:
+      serial: The serial number for the new target device.
+      serial_location_map: The serial location map.
+      check_status: Whether to check provision status for the target device.
+    """
+    try:
+      controller = self._fastboot_device_controller(serial)
+      location = None
+      if serial in serial_location_map:
+        location = serial_location_map[serial]
+
+      new_target_dev = DeviceInfo(controller, serial, location)
+      if check_status:
         self.CheckProvisionStatus(new_target_dev)
-        self.target_devs.append(new_target_dev)
+      self.target_devs.append(new_target_dev)
+    except FastbootFailure as e:
+      e.msg = ('Error while creating new device: ' + str(new_target_dev) +
+               '\n'+ e.msg)
+      self.stable_serials.remove(serial)
+      raise e
 
   def _AddNewAtfa(self, atfa_serial):
     """Create a new ATFA device object.
@@ -473,19 +548,13 @@ class AtftManager(object):
     success_serials = []
     for serial in self._reboot_callbacks:
       if serial in self.stable_serials:
-        if self._reboot_callbacks[serial].lock.acquire(False):
+        callback_lock = self._reboot_callbacks[serial].lock
+        # Make sure the timeout callback would not be called at the same time.
+        if callback_lock and callback_lock.acquire(False):
           success_serials.append(serial)
 
     for serial in success_serials:
-      target = self.GetTargetDevice(serial)
-      if target:
-        if (target.provision_status == ProvisionStatus.FUSEVBOOT_SUCCESS or
-            target.provision_status == ProvisionStatus.FUSEVBOOT_ING):
-          target.provision_status = ProvisionStatus.REBOOT_SUCCESS
-        self._reboot_callbacks[serial].success()
-
-      if self.atfa_dev and self.atfa_dev.serial_number == serial:
-        self._reboot_callbacks[serial].success()
+      self._reboot_callbacks[serial].success()
 
   def _ParseStateString(self, state_string):
     """Parse the string returned by 'at-vboot-state' to a key-value map.
@@ -500,7 +569,7 @@ class AtftManager(object):
     lines = state_string.splitlines()
     for line in lines:
       if line.startswith(BOOTLOADER_STRING):
-        key_value = line.replace(BOOTLOADER_STRING, '').split(': ')
+        key_value = re.split(r':[\s]*|=', line.replace(BOOTLOADER_STRING, ''))
         if len(key_value) == 2:
           state_map[key_value[0]] = key_value[1]
     return state_map
@@ -554,6 +623,7 @@ class AtftManager(object):
       if not status_set:
         target_dev.provision_status = ProvisionStatus.FUSEVBOOT_SUCCESS
       target_dev.provision_state.bootloader_locked = True
+
 
   def TransferContent(self, src, dst):
     """Transfer content from a device to another device.
@@ -634,7 +704,7 @@ class AtftManager(object):
       self.CheckProvisionStatus(target)
       if not target.provision_state.provisioned:
         raise FastbootFailure('Status not updated.')
-    except FastbootFailure as e:
+    except (FastbootFailure, DeviceNotFoundException) as e:
       target.provision_status = ProvisionStatus.PROVISION_FAILED
       raise e
 
@@ -664,6 +734,10 @@ class AtftManager(object):
       self.CheckProvisionStatus(target)
       if not target.provision_state.bootloader_locked:
         raise FastbootFailure('Status not updated.')
+
+      # # Another possible flow:
+      # target.Flash('sec', temp_file_name)
+      # os.remove(temp_file_name)
     except FastbootFailure as e:
       target.provision_status = ProvisionStatus.FUSEVBOOT_FAILED
       raise e
@@ -726,40 +800,64 @@ class AtftManager(object):
     If we see the device again within timeout, call the success_callback,
     otherwise call the timeout_callback.
     """
-    target.provision_status = ProvisionStatus.REBOOT_ING
     try:
       target.Reboot()
       serial = target.serial_number
+      location = target.location
       # We assume after the reboot the device would disappear
+      self.target_devs.remove(target)
       del target
       self.stable_serials.remove(serial)
+      # Create a rebooting target device that only contains serial and location.
+      rebooting_target = DeviceInfo(None, serial, location)
+      rebooting_target.provision_status = ProvisionStatus.REBOOT_ING
+      self.target_devs.append(rebooting_target)
+
       reboot_callback = RebootCallback(
           timeout,
-          self.RebootCallbackWrapper(success_callback, serial),
-          self.RebootCallbackWrapper(timeout_callback, serial))
+          self.RebootCallbackWrapper(success_callback, serial, True),
+          self.RebootCallbackWrapper(timeout_callback, serial, False))
       self._reboot_callbacks[serial] = reboot_callback
 
     except FastbootFailure as e:
       target.provision_status = ProvisionStatus.REBOOT_FAILED
       raise e
 
-  def RebootCallbackWrapper(self, callback, serial):
+  def RebootCallbackWrapper(self, callback, serial, success):
     """This wrapper function wraps the original callback function.
 
-    Some clean up operations are added.
-    We need to remove the handler if callback is called.
-    We need to release the resource the handler requires.
+    Some clean up operations are added. We need to remove the handler if
+    callback is called. We need to release the resource the handler requires.
+    We also needs to remove the rebooting device from the target list since a
+    new device would be created if the device reboot successfully.
 
     Args:
       callback: The original callback function.
       serial: The serial number for the device.
+      success: Whether this is the success callback.
     Returns:
       An extended callback function.
     """
-    def RebootCallbackFunc(callback=callback, serial=serial):
-      callback()
-      self._reboot_callbacks[serial].Release()
-      del self._reboot_callbacks[serial]
+    def RebootCallbackFunc(callback=callback, serial=serial, success=success):
+      try:
+        rebooting_dev = self.GetTargetDevice(serial)
+        if rebooting_dev:
+          self.target_devs.remove(rebooting_dev)
+          del rebooting_dev
+        if success:
+          serial_location_map = self._serial_mapper.get_serial_map()
+          self._CreateNewTargetDevice(serial, serial_location_map, True)
+          self.GetTargetDevice(serial).provision_status = (
+              ProvisionStatus.REBOOT_SUCCESS)
+        callback()
+        self._reboot_callbacks[serial].Release()
+        del self._reboot_callbacks[serial]
+      except FastbootFailure as e:
+        # Release the lock so that it can be obtained again.
+        self._reboot_callbacks[serial].lock.release()
+        raise e
+
+
 
     return RebootCallbackFunc
 

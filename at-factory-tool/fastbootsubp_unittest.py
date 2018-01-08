@@ -111,6 +111,7 @@ class FastbootSubpTest(unittest.TestCase):
     message = device.Oem(command, False)
     mock_fastboot_commands.assert_called_once_with(
         ['fastboot', '-s', self.TEST_SERIAL, 'oem', command],
+        stderr=subprocess.STDOUT,
         creationflags=CREATE_NO_WINDOW)
     self.assertEqual(self.TEST_MESSAGE_SUCCESS, message)
 
