@@ -399,11 +399,9 @@ class AtftManager(object):
     atfa_serial = self._atfa_dev_setting.serial_number
     if atfa_serial in self.stable_serials:
       # We found the ATFA device again.
-      serial_location_map = self._serial_mapper.get_serial_map()
+      self._serial_mapper.refresh_serial_map()
       controller = self._fastboot_device_controller(atfa_serial)
-      location = None
-      if atfa_serial in serial_location_map:
-        location = serial_location_map[atfa_serial]
+      location = self._serial_mapper.get_location(atfa_serial)
       self.atfa_dev = DeviceInfo(controller, atfa_serial, location)
 
     # Clean the state
@@ -443,25 +441,21 @@ class AtftManager(object):
     common_serials = [device.serial_number for device in self.target_devs]
 
     # Create new device object for newly added devices.
-    serial_location_map = self._serial_mapper.get_serial_map()
+    self._serial_mapper.refresh_serial_map()
     for serial in new_targets:
       if serial not in common_serials:
-        self._CreateNewTargetDevice(serial, serial_location_map)
+        self._CreateNewTargetDevice(serial)
 
-  def _CreateNewTargetDevice(
-      self, serial, serial_location_map, check_status=True):
+  def _CreateNewTargetDevice(self, serial, check_status=True):
     """Create a new target device object.
 
     Args:
       serial: The serial number for the new target device.
-      serial_location_map: The serial location map.
       check_status: Whether to check provision status for the target device.
     """
     try:
       controller = self._fastboot_device_controller(serial)
-      location = None
-      if serial in serial_location_map:
-        location = serial_location_map[serial]
+      location = self._serial_mapper.get_location(serial)
 
       new_target_dev = DeviceInfo(controller, serial, location)
       if check_status:
@@ -482,11 +476,9 @@ class AtftManager(object):
     Args:
       atfa_serial: The serial number of the ATFA device to be added.
     """
+    self._serial_mapper.refresh_serial_map()
     controller = self._fastboot_device_controller(atfa_serial)
-    serial_location_map = self._serial_mapper.get_serial_map()
-    location = None
-    if atfa_serial in serial_location_map:
-      location = serial_location_map[atfa_serial]
+    location = self._serial_mapper.get_location(atfa_serial)
     if self._atfa_reboot_lock.acquire(False):
       # If there's not an atfa setting os already happening
       self._atfa_dev_setting = DeviceInfo(controller, atfa_serial, location)
@@ -845,8 +837,8 @@ class AtftManager(object):
           self.target_devs.remove(rebooting_dev)
           del rebooting_dev
         if success:
-          serial_location_map = self._serial_mapper.get_serial_map()
-          self._CreateNewTargetDevice(serial, serial_location_map, True)
+          self._serial_mapper.refresh_serial_map()
+          self._CreateNewTargetDevice(serial, True)
           self.GetTargetDevice(serial).provision_status = (
               ProvisionStatus.REBOOT_SUCCESS)
         callback()

@@ -411,16 +411,30 @@ class AtftManTest(unittest.TestCase):
     # Nothing appears twice.
     self.assertEqual(0, len(atft_manager.target_devs))
 
+  def mockSetSerialMapper(self, serial_map):
+    self.serial_map = {}
+    for serial in serial_map:
+      self.serial_map[serial.lower()] = serial_map[serial]
+
+  def mockGetLocation(self, serial):
+    serial_lower = serial.lower()
+    if serial_lower in self.serial_map:
+      return self.serial_map[serial_lower]
+    return None
+
   @patch('threading.Timer')
   def testListDevicesLocation(self, mock_create_timer):
     mock_create_timer.side_effect = self.MockCreateInstantTimer
     mock_serial_mapper = MagicMock()
-    mock_serial_instance = MagicMock()
-    mock_serial_mapper.return_value = mock_serial_instance
-    mock_serial_instance.get_serial_map.return_value = {
+    smap = {
         self.ATFA_TEST_SERIAL: self.TEST_LOCATION,
         self.TEST_SERIAL: self.TEST_LOCATION2
     }
+    mock_serial_instance = MagicMock()
+    mock_serial_mapper.return_value = mock_serial_instance
+    mock_serial_instance.refresh_serial_map.side_effect = (
+        lambda serial_map=smap: self.mockSetSerialMapper(serial_map))
+    mock_serial_instance.get_location.side_effect = self.mockGetLocation
     mock_fastboot = MagicMock()
     mock_fastboot.side_effect = self.MockInit
     atft_manager = atftman.AtftManager(
@@ -440,11 +454,14 @@ class AtftManTest(unittest.TestCase):
     mock_serial_mapper = MagicMock()
     mock_serial_instance = MagicMock()
     mock_serial_mapper.return_value = mock_serial_instance
-    mock_serial_instance.get_serial_map.return_value = {
+    smap = {
         self.TEST_SERIAL: self.TEST_LOCATION,
         self.TEST_SERIAL2: self.TEST_LOCATION2,
         self.TEST_SERIAL3: self.TEST_LOCATION3
     }
+    mock_serial_instance.refresh_serial_map.side_effect = (
+        lambda serial_map=smap: self.mockSetSerialMapper(serial_map))
+    mock_serial_instance.get_location.side_effect = self.mockGetLocation
     mock_fastboot = MagicMock()
     mock_fastboot.side_effect = self.MockInit
     atft_manager = atftman.AtftManager(
@@ -463,11 +480,14 @@ class AtftManTest(unittest.TestCase):
     mock_serial_mapper = MagicMock()
     mock_serial_instance = MagicMock()
     mock_serial_mapper.return_value = mock_serial_instance
-    mock_serial_instance.get_serial_map.return_value = {
+    smap = {
         self.TEST_SERIAL: self.TEST_LOCATION,
         self.TEST_SERIAL2: self.TEST_LOCATION2,
         self.TEST_SERIAL3: self.TEST_LOCATION3
     }
+    mock_serial_instance.refresh_serial_map.side_effect = (
+        lambda serial_map=smap: self.mockSetSerialMapper(serial_map))
+    mock_serial_instance.get_location.side_effect = self.mockGetLocation
     mock_fastboot = MagicMock()
     mock_fastboot.side_effect = self.MockInit
     atft_manager = atftman.AtftManager(
@@ -486,11 +506,14 @@ class AtftManTest(unittest.TestCase):
     mock_serial_mapper = MagicMock()
     mock_serial_instance = MagicMock()
     mock_serial_mapper.return_value = mock_serial_instance
-    mock_serial_instance.get_serial_map.return_value = {
+    smap = {
         self.TEST_SERIAL: self.TEST_LOCATION,
         self.TEST_SERIAL2: self.TEST_LOCATION2,
         self.TEST_SERIAL3: self.TEST_LOCATION3
     }
+    mock_serial_instance.refresh_serial_map.side_effect = (
+        lambda serial_map=smap: self.mockSetSerialMapper(serial_map))
+    mock_serial_instance.get_location.side_effect = self.mockGetLocation
     mock_fastboot = MagicMock()
     mock_fastboot_instance = MagicMock()
     mock_fastboot.side_effect = self.MockInit

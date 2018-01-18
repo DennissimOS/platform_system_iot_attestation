@@ -63,12 +63,10 @@ class SerialMapper(object):
 
   def __init__(self):
     self.setupapi = ctypes.WinDLL('setupapi')
+    self.serial_map = {}
 
-  def get_serial_map(self):
-    """Get the serial_number -> USB location map.
-
-    Returns:
-      A Dictionary of {serial_number: USB location}
+  def refresh_serial_map(self):
+    """Refresh the serial_number -> USB location map.
     """
     serial_map = {}
     device_inf_set = None
@@ -131,12 +129,25 @@ class SerialMapper(object):
       instance_id = device_instance_id_buffer.value
       instance_parts = instance_id.split('\\')
       if instance_parts:
-        serial = instance_parts.pop()
+        serial = instance_parts.pop().lower()
         serial_map[serial] = location
       i += 1
 
     # Destroy the device information set
     if device_inf_set is not None:
       SetupDiDestroyDeviceInfoList(device_inf_set)
-    return serial_map
+    self.serial_map = serial_map
+
+  def get_location(self, serial):
+    """Get the USB location according to the serial number.
+
+    Args:
+      serial: The serial number for the device.
+    Returns:
+      The USB physical location for the device.
+    """
+    serial_lower = serial.lower()
+    if serial_lower in self.serial_map:
+      return self.serial_map[serial_lower]
+    return None
 

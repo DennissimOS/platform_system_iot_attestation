@@ -25,16 +25,16 @@ class SerialMapper(object):
 
   USB_DEVICES_PATH = '/sys/bus/usb/devices/'
 
-  def get_serial_map(self):
-    """Get the serial_number -> USB location map.
+  def __init__(self):
+    self.serial_map = {}
 
-    Returns:
-      A Dictionary of {serial_number: USB location}
+  def refresh_serial_map(self):
+    """Refresh the serial_number -> USB location map.
     """
     serial_to_location_map = {}
     # check if sysfs is mounted.
     if not os.path.exists(self.USB_DEVICES_PATH):
-      return serial_to_location_map
+      return
 
     for device_folder_name in os.listdir(self.USB_DEVICES_PATH):
       device_folder = os.path.join(self.USB_DEVICES_PATH, device_folder_name)
@@ -47,7 +47,20 @@ class SerialMapper(object):
           serial_path = os.path.join(device_folder, 'serial')
           if os.path.isfile(serial_path):
             with open(serial_path) as f:
-              serial = f.readline().rstrip('\n')
+              serial = f.readline().rstrip('\n').lower()
               serial_to_location_map[serial] = device_folder_name
 
-    return serial_to_location_map
+    self.serial_map = serial_to_location_map
+
+  def get_location(self, serial):
+    """Get the USB location according to the serial number.
+
+    Args:
+      serial: The serial number for the device.
+    Returns:
+      The USB physical location for the device.
+    """
+    serial_lower = serial.lower()
+    if serial_lower in self.serial_map:
+      return self.serial_map[serial_lower]
+    return None
